@@ -11,15 +11,28 @@ public class MotionCoreTest {
     }
     @Test public void densityAndSpeedDetermineRelease() {
         MotionConfig c = MotionConfig.defaults();
-        assertFalse(FlymeMotion.expand(.2f, 500, 0, 3, c));
-        assertTrue(FlymeMotion.expand(.2f, 800, 0, 3, c));
-        assertFalse(FlymeMotion.expand(.8f, -800, 0, 3, c));
+        // A flick is decided by the flick itself, whichever way it points.
+        assertFalse(FlymeMotion.expand(.2f, -800, 0, 3, c));
+        assertTrue(FlymeMotion.expand(.8f, 800, 0, 3, c));
+        // Sideways at speed is not an unlock.
         assertTrue(FlymeMotion.expand(.8f, -800, 2000, 3, c));
+    }
+    @Test public void aSlowDragUnlocksOnDistanceAndSpringsBackShortOfIt() {
+        MotionConfig c = MotionConfig.defaults();
+        // Too slow to be a flick, so position decides: past the threshold commits the unlock.
+        assertFalse(FlymeMotion.expand(.6f, -100, 0, 3, c));
+        assertTrue(FlymeMotion.expand(.4f, -100, 0, 3, c));
     }
     @Test public void thresholdIsStrictAndConfigurable() {
         MotionConfig c = MotionConfig.defaults();
-        assertFalse(FlymeMotion.expand(.5f, 0, 0, 3, c));
-        assertTrue(FlymeMotion.expand(.5001f, 0, 0, 3, c));
+        // Exactly at the threshold still springs back; just past it commits the unlock.
+        assertTrue(FlymeMotion.expand(.5f, 0, 0, 3, c));
+        assertFalse(FlymeMotion.expand(.5001f, 0, 0, 3, c));
+        // The slider moves the distance a slow drag has to cover; the manager shows it as
+        // "慢滑解锁距离 = 1 - threshold", so a lower threshold means an easier unlock.
+        MotionConfig near = c.withThreshold(.15f);
+        assertFalse(FlymeMotion.expand(.2f, 0, 0, 3, near));
+        assertTrue(FlymeMotion.expand(.1f, 0, 0, 3, near));
     }
     @Test public void blurIsNativeRatioRatherThanFlymePixels() {
         assertEquals(0, FlymeMotion.nativeBlurRatio(1, 1), 0);
@@ -50,8 +63,42 @@ public class MotionCoreTest {
         assertEquals(24, custom.withBottomRegion(BottomGestureRegion.defaults()).cornerRadiusDp, 0);
         assertEquals(c.revision + 1, custom.revision);
     }
-    @Test public void configurationIsPinnedUntilSettled() {
-        GestureSession s = new GestureSession(); long token = s.begin();
+    @Test public void everyWithKeepsEveryOtherChoice() {
+        // Each with… writes one field and must carry the rest over untouched. A forgotten field here
+        // does not fail loudly: it silently resets the user's other settings whenever they move one
+        // slider. All of them go through one copy helper for that reason, and this pins it.
+        MotionConfig base = MotionConfig.defaults().withCornerRadius(24).withLateDesktopAnimation(true)
+                .withBottomRegion(new BottomGestureRegion(false, .3f, .8f, .4f)).withThreshold(.2f);
+        keepsTheRest(base.withEnabled(false), base, "enabled");
+        keepsTheRest(base.withLateDesktopAnimation(false), base, "late");
+        keepsTheRest(base.withCornerRadius(0), base, "corner");
+        keepsTheRest(base.withThreshold(.7f), base, "threshold");
+        keepsTheRest(base.withBottomRegion(BottomGestureRegion.defaults()), base, "region");
+        // ... and the field each one is named for really is the one that changed.
+        assertFalse(base.withEnabled(false).enabled);
+        assertFalse(base.withLateDesktopAnimation(false).lateDesktopAnimation);
+        assertEquals(0, base.withCornerRadius(0).cornerRadiusDp, 0);
+        assertEquals(.7f, base.withThreshold(.7f).threshold, 0);
+        assertEquals(BottomGestureRegion.defaults(), base.withBottomRegion(BottomGestureRegion.defaults()).bottomRegion);
+    }
+    /**
+     * Every field except {@code changedField} must still hold exactly what {@code base} held, and the
+     * revision must have advanced exactly once.
+     */
+    private static void keepsTheRest(MotionConfig changed, MotionConfig base, String changedField) {
+        if (!"enabled".equals(changedField)) assertEquals(base.enabled, changed.enabled);
+        if (!"late".equals(changedField)) assertEquals(base.lateDesktopAnimation, changed.lateDesktopAnimation);
+        if (!"stiffness".equals(changedField)) assertEquals(base.stiffness, changed.stiffness, 0);
+        if (!"expand".equals(changedField)) assertEquals(base.expandDamping, changed.expandDamping, 0);
+        if (!"close".equals(changedField)) assertEquals(base.closeDamping, changed.closeDamping, 0);
+        if (!"velocity".equals(changedField)) assertEquals(base.minimumVelocityDp, changed.minimumVelocityDp, 0);
+        if (!"threshold".equals(changedField)) assertEquals(base.threshold, changed.threshold, 0);
+        if (!"blur".equals(changedField)) assertEquals(base.blurStrength, changed.blurStrength, 0);
+        if (!"corner".equals(changedField)) assertEquals(base.cornerRadiusDp, changed.cornerRadiusDp, 0);
+        if (!"region".equals(changedField)) assertEquals(base.bottomRegion, changed.bottomRegion);
+        assertEquals(base.revision + 1, changed.revision);
+    }
+    @Test public void configurationIsPinnedUntilSettled() {        GestureSession s = new GestureSession(); long token = s.begin();
         s.update(MotionConfig.defaults().withEnabled(false));
         assertTrue(s.config().enabled); s.finish(token); assertFalse(s.config().enabled);
     }

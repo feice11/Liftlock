@@ -30,4 +30,15 @@ public final class WallpaperFrameBindingTest {
         assertFalse(WallpaperFrameBinding.matches(2,2,true,true,8,1,-1,-1));
         assertFalse(WallpaperFrameBinding.matches(2,2,true,true,8,1,0,0));
     }
+    @Test public void eitherEngineLayerMayBeTheRegisteredClientRoot() {
+        // Inspected build: the engine root itself is the registered client surface.
+        assertTrue(WallpaperFrameBinding.matches(2,2,true,true,8,1,56,0,56));
+        // A build whose engine owns both a root and a BLAST buffer beneath it: either one may be
+        // what WMS registered, and the layer that is neither still never qualifies.
+        assertTrue(WallpaperFrameBinding.matches(2,2,true,true,39,2,60,61,61));
+        assertFalse(WallpaperFrameBinding.matches(2,2,true,true,39,2,60,61,59));
+        // An unknown buffer layer does not weaken the root comparison.
+        assertFalse(WallpaperFrameBinding.matches(2,2,true,true,39,2,60,-1,59));
+        assertFalse(WallpaperFrameBinding.matches(2,2,true,true,39,2,60,0,59));
+    }
 }

@@ -33,6 +33,17 @@ final class NativeReflection {
         try { return field(target.getClass(), name).get(target); }
         catch (ReflectiveOperationException e) { throw new IllegalStateException(e); }
     }
+    /**
+     * Reads {@code name} as declared on {@code owner} or above, not on the instance's own class.
+     * A MIUI subclass redeclares some of the panel's fields, so the same name is two fields: the
+     * driver this module calls writes the one on the class that declares the driver, which is the
+     * owner here, while a plain get() would read the shadowing one on the subclass.
+     */
+    static Object getOn(Object target, Class<?> owner, String name) {
+        if (owner == null) return null;
+        try { return field(owner, name).get(target); }
+        catch (ReflectiveOperationException e) { throw new IllegalStateException(e); }
+    }
     static boolean bool(Object target, String name) { return (boolean) get(target, name); }
     static float number(Object target, String name) { return ((Number) get(target, name)).floatValue(); }
     static int integer(Object target, String name) { return ((Number) get(target, name)).intValue(); }

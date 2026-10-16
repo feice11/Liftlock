@@ -47,21 +47,33 @@ public final class MotionConfig {
     }
 
     public MotionConfig withEnabled(boolean value) {
-        return new MotionConfig(value, lateDesktopAnimation, stiffness, expandDamping, closeDamping,
-                minimumVelocityDp, threshold, blurStrength, revision + 1, bottomRegion, cornerRadiusDp);
+        return copy(value, lateDesktopAnimation, stiffness, expandDamping, closeDamping,
+                minimumVelocityDp, threshold, blurStrength, bottomRegion, cornerRadiusDp);
     }
 
     public MotionConfig withLateDesktopAnimation(boolean value) {
-        return new MotionConfig(enabled,value,stiffness,expandDamping,closeDamping,minimumVelocityDp,
-                threshold,blurStrength,revision+1,bottomRegion,cornerRadiusDp);
+        return copy(enabled, value, stiffness, expandDamping, closeDamping, minimumVelocityDp,
+                threshold, blurStrength, bottomRegion, cornerRadiusDp);
     }
     public MotionConfig withBottomRegion(BottomGestureRegion value) {
-        return new MotionConfig(enabled, lateDesktopAnimation, stiffness, expandDamping, closeDamping,
-                minimumVelocityDp, threshold, blurStrength, revision + 1, value, cornerRadiusDp);
+        return copy(enabled, lateDesktopAnimation, stiffness, expandDamping, closeDamping,
+                minimumVelocityDp, threshold, blurStrength, value, cornerRadiusDp);
+    }
+    /** The distance a slow drag must cover: the manager shows it as {@code 1 - threshold}. */
+    public MotionConfig withThreshold(float value) {
+        return copy(enabled, lateDesktopAnimation, stiffness, expandDamping, closeDamping,
+                minimumVelocityDp, value, blurStrength, bottomRegion, cornerRadiusDp);
     }
     public MotionConfig withCornerRadius(float dp) {
+        return copy(enabled, lateDesktopAnimation, stiffness, expandDamping, closeDamping,
+                minimumVelocityDp, threshold, blurStrength, bottomRegion, dp);
+    }
+    /** Every {@code with…} goes through here, so a new field can never be silently dropped. */
+    private MotionConfig copy(boolean enabled, boolean lateDesktopAnimation, float stiffness, float expandDamping,
+                              float closeDamping, float minimumVelocityDp, float threshold, float blurStrength,
+                              BottomGestureRegion bottomRegion, float cornerRadiusDp) {
         return new MotionConfig(enabled, lateDesktopAnimation, stiffness, expandDamping, closeDamping,
-                minimumVelocityDp, threshold, blurStrength, revision + 1, bottomRegion, dp);
+                minimumVelocityDp, threshold, blurStrength, revision + 1, bottomRegion, cornerRadiusDp);
     }
 
     public static float bounded(float value, float min, float max, float fallback) {

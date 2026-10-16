@@ -22,4 +22,6 @@ public final class BackdropBlend {
         phase = Phase.EXPOSED; return true;
     }
     public synchronized boolean exposed() { return phase == Phase.EXPOSED; }
+    /** The current phase, for diagnostics: a fade that never completes reads as FADING forever. */
+    public synchronized Phase phase() { return phase; }
 }

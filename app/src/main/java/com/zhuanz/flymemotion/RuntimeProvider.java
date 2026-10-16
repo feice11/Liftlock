@@ -17,7 +17,7 @@ import com.zhuanz.flymemotion.core.ReloadPlan;
 /** No notification/app content: bounded process receipts from scoped native UIDs. */
 public final class RuntimeProvider extends ContentProvider {
     public static final Uri URI = Uri.parse("content://com.zhuanz.flymemotion.runtime");
-    public static final String[] COLUMNS = {"package", "state", "hooks", "motion", "blur", "entry", "pid", "boot", "elapsed", "error", "build", "configRevision", "enabled", "moduleVersion", "touch", "drag", "height", "release", "scene", "gesture", "panelFound", "keyguardFound", "intercept", "fling", "spring", "blocked", "layers", "wallpaper", "fastRedirect", "wallpaperFrames", "coordinatedRelease", "nativeRelease", "releaseReason", "gestureJournal", "liveScene", "sceneSession", "surfaceGeneration", "returnTarget", "sceneReadiness", "revokeNonce", "motionFrame", "scaleSuppressed", "wallpaperBound", "startOnly", "sceneWorkMaxMs", "lastHomeReadiness", "lastExitReadiness", "desktopAnimationState", "desktopAnimationDetail", "compat"};
+    public static final String[] COLUMNS = {"package", "state", "hooks", "motion", "blur", "entry", "pid", "boot", "elapsed", "error", "build", "configRevision", "enabled", "moduleVersion", "touch", "drag", "height", "release", "scene", "gesture", "panelFound", "keyguardFound", "intercept", "fling", "spring", "blocked", "layers", "wallpaper", "fastRedirect", "wallpaperFrames", "coordinatedRelease", "nativeRelease", "releaseReason", "gestureJournal", "liveScene", "sceneSession", "surfaceGeneration", "returnTarget", "sceneReadiness", "revokeNonce", "motionFrame", "scaleSuppressed", "wallpaperBound", "startOnly", "sceneWorkMaxMs", "lastHomeReadiness", "lastExitReadiness", "desktopAnimationState", "desktopAnimationDetail", "diag", "compat"};
     private static final Set<String> PACKAGES = Set.of("com.android.systemui", "com.android.settings", "android", "com.miui.miwallpaper");
     private SharedPreferences receipts;
     @Override public boolean onCreate() {
@@ -61,7 +61,10 @@ public final class RuntimeProvider extends ContentProvider {
                 if (key.equals("package")) continue;
                 Object value = extras.get(key);
                 String text = value == null ? "" : String.valueOf(value);
-                int limit = key.equals("gestureJournal") ? 8192 : key.equals("compat") ? 4096 : key.equals("layers") ? 4096 : key.equals("sceneReadiness") || key.equals("lastHomeReadiness") || key.equals("lastExitReadiness") ? 2048 : 512;
+                // "diag" is the short line that carries the fields a waiting scene is decided by, so
+                // truncating it at the default 512 silently removed exactly those fields.
+                int limit = key.equals("gestureJournal") ? 8192 : key.equals("compat") ? 4096 : key.equals("layers") ? 4096
+                        : key.equals("sceneReadiness") || key.equals("lastHomeReadiness") || key.equals("lastExitReadiness") || key.equals("diag") ? 2048 : 512;
                 edit.putString(arg + "." + key, text.substring(0, Math.min(limit, text.length())));
             }
             edit.putString(arg + ".elapsed", Long.toString(SystemClock.elapsedRealtime())).commit();

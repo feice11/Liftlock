@@ -96,6 +96,43 @@ public class MembersTest {
     @SuppressWarnings("unused")
     private final Wake observer = new Wake() { @Override public void onStartedWakingUp() {} };
 
+    // "Android 15" panel shape: the AOSP class declares the writer abstract and the MIUI subclass
+    // that is instantiated implements it, so only the subclass has a body to hook.
+    @SuppressWarnings("unused")
+    static abstract class PanelBase {
+        abstract void setExpandedHeightInternal(float h);
+        void isTracking() {}
+    }
+    @SuppressWarnings("unused")
+    static class MiuiPanel extends PanelBase {
+        @Override void setExpandedHeightInternal(float h) {}
+    }
+
+    @Test public void abstractDeclarationIsNotTheRealMethod() {
+        Members.Sig writer = Members.Sig.of("setExpandedHeightInternal", float.class);
+        assertNotNull("the name is still findable on the panel", Members.method(PanelBase.class, writer));
+        assertNull("but it has no body to hook", Members.concrete(PanelBase.class, writer));
+        assertEquals("the implementation is the subclass's", MiuiPanel.class,
+                Members.concrete(MiuiPanel.class, writer).getDeclaringClass());
+        assertEquals("isTracking", Members.concrete(PanelBase.class, Members.Sig.of("isTracking")).getName());
+        assertNull(Members.concrete(PanelBase.class, Members.Sig.of("nothing")));
+    }
+
+    // MIUI names the field an anonymous class is assigned to with an `m` prefix: the class becomes
+    // MembersTest$mObserver$1 where the AOSP shape would be MembersTest$observer$1.
+    interface Tag { void ping(); }
+    @SuppressWarnings("unused")
+    static class mObserver {
+        static final Tag one = new Tag() { @Override public void ping() {} };
+    }
+
+    @Test public void innerClassesAlsoMatchMiuiFieldNames() {
+        ClassLoader loader = MembersTest.class.getClassLoader();
+        Class<?> found = Members.inner(loader, MembersTest.class, c -> Members.declares(c, "ping"), "observer");
+        assertNotNull("m-prefixed field name is the MIUI shape", found);
+        assertTrue(Members.declares(found, "ping"));
+    }
+
     @Test public void prefixedLambdaIndex() {
         assertNotNull(Members.prefixed(Panel.class, "access$", Panel.class, Object.class));
         assertNull(Members.prefixed(Panel.class, "lambda$", Panel.class));

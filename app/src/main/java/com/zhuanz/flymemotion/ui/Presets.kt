@@ -12,7 +12,7 @@ data class MotionParams(
     val threshold: Float,
     val blurStrength: Float,
 ) {
-    /** Keeps the switch, late-desktop choice, bottom region and corners; one revision per save. */
+    /** Keeps the switch, late-desktop choice, bottom region and corners. */
     fun applyTo(c: MotionConfig): MotionConfig = MotionConfig(
         c.enabled, c.lateDesktopAnimation, stiffness, expandDamping, closeDamping,
         minimumVelocityDp, threshold, blurStrength, c.revision + 1, c.bottomRegion, c.cornerRadiusDp,

@@ -54,14 +54,25 @@ final class SystemServerSceneHooks {
     private boolean lastReady;
     private boolean homeEngineDrawn, lockEngineDrawn;
     private long homeGeneration, lockGeneration;
+    /** How long the scene must stay un-presentable before the cover re-protects; see publishScene. */
+    private static final long COVER_RECOVER_MS = 400;
+    /** When the scene was last seen not ready; 0 while ready. */
+    private long unreadySince;
     private final com.zhuanz.flymemotion.core.SceneStatusOrder producerOrder = new com.zhuanz.flymemotion.core.SceneStatusOrder();
     private List<android.os.Bundle> producerFrames = List.of();
+    // The wallpaper's frame receipt hop, counted so a silent producer is told apart from a
+    // producer whose frames arrive but are filtered out by the orders/liveness checks above.
+    private long producerStatusSeen, producerStatusDropped;
     private SceneSurfaceState surfaces;
     private ServerWallpaperMirror mirror;
     private ServerSceneCover cover;
     private NativePresentationFence fences;
     private boolean nativeExitRequested;
     private long nativeExitRequest=-1;
+    /** Why {@link #ensureReturnProof} last refused to request a draw, or null when it did. */
+    private volatile String drawGate;
+    /** Which wallpaper clients the tokens belong to; see bindWallpapers. */
+    private volatile String wallpaperClients = "none";
     private final com.zhuanz.flymemotion.core.SceneRequestOrder nativeExitOrder=new com.zhuanz.flymemotion.core.SceneRequestOrder();
     private TargetDrawDispatcher drawDispatcher;
     private final com.zhuanz.flymemotion.core.ScenePresentation presentation = new com.zhuanz.flymemotion.core.ScenePresentation();
@@ -81,6 +92,8 @@ final class SystemServerSceneHooks {
     private final ThreadLocal<Object> activatingActivity = new ThreadLocal<>();
     private Object resumedByScene;
     private boolean resumeAcknowledged;
+    /** When {@link #startClientIfStopped} forced this target's resume; see {@link #rendererReady}. */
+    private long resumedBySceneAt;
     private boolean revealing, sleepingBarrier;
     private Method checkVisibility, wallpaperWindows, ensureVisible, adjustWallpaper, relativeLayer, clientVisibility;
     private boolean nativeTakeoverConfirmed;
@@ -102,8 +115,18 @@ final class SystemServerSceneHooks {
                 }
                 // A peer lease is liveness, never presentation proof or a handoff deadline.
                 if (!lease.active(now()) && presentation.handoff() && nativeUnlockStarted() && !sleepingBarrier && interactive) lease.renewHandoff(now());
-                if (!lease.active(now()) || !allowed()) { stop("场景已回滚：超时或原生状态改变"); return; }
+                if (!lease.active(now()) || !allowed()) { stop("场景已回滚：超时或原生状态改变 " + allowedDetail()); return; }
                 if (!presentation.handoff() && resumedByScene != null && !inputOwnedByShade()) { stop("场景已回滚：SystemUI 输入焦点已交接"); return; }
+                // The handoff hold must not outlive its bound even while the lease keeps renewing.
+                // Without this, a handoff that never completes (no native takeover / exposure on this
+                // build) keeps the scene alive with the cover opaque forever - the desktop showing
+                // only its wallpaper, the control panel invisible behind the cover, and the swipe
+                // unresponsive - until a sleep forces the cancel path. stop() itself only re-checks
+                // the bound when it is re-invoked, and this loop re-invokes it only on lease expiry
+                // or ineligibility, both of which the renew above forestalls.
+                if (presentation.handoff() && nativeUnlockStarted() && handoffHoldExpired()) {
+                    stop("handoff 超时未取得完整回执，交回原生并退役覆盖"); return;
+                }
                 Object next = appAllowed() && safeActivity(candidate) ? candidate : null;
                 if (presentation.handoff() && safeActivity(target)) next = target;
                 if (target != next) {
@@ -205,9 +228,12 @@ final class SystemServerSceneHooks {
             register(goingAway,chain->{
                 // Authenticated HOME exit: hide the retired LOCK producer before WM builds the
                 // keyguard transition that would otherwise show it above the desktop wallpaper.
-                // Going-away itself proves authentication. A fast swipe can end the scene (or not
-                // yet report canDismiss) before this point, so also cover a HOME scene that
-                // ended moments ago; otherwise MIUI re-shows and fades the blurred LOCK buffer.
+                // A swipe can end the scene (or not yet report canDismiss) before this point, so
+                // also cover a HOME scene that ended moments ago; otherwise MIUI re-shows and fades
+                // the blurred LOCK buffer.
+                // NOTE: going-away alone is *not* proof of authentication on every build - MIUI
+                // raises it mid-drag - so the retirement decision inside retireLockForHomeExit()
+                // additionally requires a real handoff. See the comment there.
                 if(chain.getThisObject()==keyguard && mirror!=null) synchronized(NativeReflection.get(wm,"mGlobalLock")){
                     exitTrace("goingAway lease="+lease.id()+" hidden="+(retireLockForHomeExit("native-going-away")!=null));
                 }
@@ -302,10 +328,24 @@ final class SystemServerSceneHooks {
                 boolean defaultDisplay = !keyguardShownDisplay || (int) chain.getArg(0) == 0;
                 if (chain.getThisObject() == keyguard && defaultDisplay && mirror != null) {
                     boolean[] state = keyguardState();
-                    if (com.zhuanz.flymemotion.core.LockCycle.newLock(state[0], state[1], state[2],
-                            (boolean)chain.getArg(o),(boolean)chain.getArg(o + 1))) {
+                    boolean showing = (boolean) chain.getArg(o), aod = (boolean) chain.getArg(o + 1);
+                    if (com.zhuanz.flymemotion.core.LockCycle.newLock(state[0], state[1], state[2], showing, aod)) {
                         mirror.clearExitSources();
                         if (presentation.handoff()) stop("新的原生锁屏周期", true);
+                        reconcileWallpapers("lock", 8);
+                    } else if (showing && !(boolean) invokeKeyguard("isKeyguardGoingAway")) {
+                        // A lockscreen that is simply up again must have its wallpaper back. The
+                        // hold below is for the exit that produced it, and this build does not
+                        // always report the boundary newLock() looks for, so relying on that alone
+                        // left the LOCK source hidden: black lockscreen with only the clock, until
+                        // something forced a real lock cycle.
+                        mirror.clearExitSources();
+                        // Nothing this module held may survive into a new lock either. A visibility
+                        // lease or a held source left over from the previous cycle is what made the
+                        // next gesture fail to trigger at all, and what kept the lockscreen black on
+                        // wake until a real boundary happened to reset it. Both calls are no-ops
+                        // unless something really did leak.
+                        if (clientLease.active()) restoreClient();
                         reconcileWallpapers("lock", 8);
                     }
                 }
@@ -346,7 +386,23 @@ final class SystemServerSceneHooks {
             register(NativeReflection.method(activity, "shouldResumeActivity", activity), chain -> {
                 // Visibility traversal alone must not resume below a sleeping input shade.
                 // Only explicit activation retains the native resume/user/AppLock checks.
+                //
+                // Once the gesture has asked to reveal, the hold is dropped. The hold exists to keep
+                // the app from coming up beneath a cover that is not there yet; by then the cover IS
+                // committed, and holding on longer deadlocks the reveal against itself - the device
+                // measured activity=STARTED with startOnly climbing, rendererReady() false, so no
+                // frame was ever requested and the cover had nothing to undraw. The app resuming
+                // behind the committed cover is exactly what gives the reveal its frame.
+                //
+                // It must also stay dropped after the handover, which is where the state leaked:
+                // `revealing` is only true while the finger is down, so it went false at release
+                // and the hold came straight back, leaving the return target unreachable. On this
+                // device the desktop wallpaper is a live wallpaper in its own process, so a launcher
+                // that cannot resume still shows its wallpaper - the phone reports that as a desktop
+                // with every icon missing, and it stayed that way until a real lock cycle. Handing
+                // the unlock to native means native decides the resume now.
                 if (chain.getThisObject() == target && allowed() && appAllowed() && coverCommitted() && safeActivity(target)
+                        && !revealing && !presentation.handoff()
                         && SceneExitPolicy.deferNativeResume((boolean)invokeKeyguard("isKeyguardShowing"),
                             (boolean)invokeKeyguard("isKeyguardLocked"), (boolean)invokeKeyguard("isKeyguardGoingAway"),
                             activatingActivity.get() == target)) {
@@ -461,10 +517,11 @@ final class SystemServerSceneHooks {
             @Override public void onReceive(Context c, Intent intent) {
                 if (!SceneReceivers.fromPackage(c, this, SceneProtocol.WALLPAPER)) return;
                 guarded(() -> {
-                    if (intent.getLongExtra("token", -1) != lease.id() || !lease.active(now())) return;
-                    if (!producerOrder.accept(lease.id(),intent.getLongExtra("statusSequence",-1))) return;
+                    if (intent.getLongExtra("token", -1) != lease.id() || !lease.active(now())) { producerStatusDropped++; return; }
+                    if (!producerOrder.accept(lease.id(),intent.getLongExtra("statusSequence",-1))) { producerStatusDropped++; return; }
                     var frames = intent.<android.os.Bundle>getParcelableArrayListExtra("frames");
                     producerFrames = frames == null ? List.of() : frames;
+                    producerStatusSeen++;
                     publishScene();
                 });
             }
@@ -539,10 +596,12 @@ final class SystemServerSceneHooks {
         if (lease.id() >= 0) { stop("新手势替换旧场景"); if (lease.id() >= 0) return; }
         if (!lease.begin(id, now())) return;
         presentation.open(id); nativeExitRequested=false; nativeTakeoverConfirmed=false;
+        // A new scene may use the protection cover again; see ServerSceneCover.rearm.
+        if (cover != null) cover.rearm();
         revealing = false; drawWindow = null; drawLayer = -1;
         producerOrder.begin(id);
         reporter.sceneSession = id;
-        if (!allowed()) { stop("锁屏/AOD/遮挡状态不允许场景"); return; }
+        if (!allowed()) { stop("锁屏/AOD/遮挡状态不允许场景 " + allowedDetail()); return; }
         clientCanDismiss = intent.getBooleanExtra("canDismiss", false);
             lateDesktopRequested = intent.getBooleanExtra("lateDesktopAnimation", false);
         Object display = NativeReflection.call(root, "getDefaultDisplay");
@@ -587,6 +646,18 @@ final class SystemServerSceneHooks {
         // real mCanDismissLockScreen snapshot, including fingerprint/face, and never sets it.
         return clientCanDismiss || presentation.handoff() && !(boolean)invokeKeyguard("isKeyguardLocked");
     }
+    /** Which term of allowed() is false on this build; diagnostics for a port to an unseen build. */
+    private String allowedDetail() {
+        try {
+            return "lease=" + lease.active(now()) + " takeover=" + nativeTakeoverConfirmed + " enabled=" + enabled
+                    + " kg=" + (keyguard != null) + " ctx=" + (context != null) + " interactive=" + interactive
+                    + " barrier=" + sleepingBarrier + " showing=" + invokeKeyguard("isKeyguardShowing")
+                    + " authExit=" + authenticatedExit() + " aod=" + invokeKeyguard("isAodShowing")
+                    + " occluded=" + invokeKeyguard("isKeyguardOccluded")
+                    + " goingAway=" + invokeKeyguard("isKeyguardGoingAway")
+                    + " target=" + (target != null) + " safe=" + safeActivity(target);
+        } catch (Throwable t) { return "detail failed: " + t; }
+    }
     private boolean safeActivity(Object activity) {
         if (activity == null || !(boolean) NativeReflection.call(activity, "attachedToProcess")
                 || NativeReflection.bool(activity, "finishing") || (int) NativeReflection.call(activity, "getDisplayId") != 0) return false;
@@ -619,11 +690,25 @@ final class SystemServerSceneHooks {
         long selectedLayer = wallpaperLayer(controller, true);
         Object nextWindow = null, nextToken = null;
         homeTokens.clear();
+        StringBuilder tokenJournal = new StringBuilder();
         for (Object token : (List<?>) NativeReflection.get(controller, "mWallpaperTokens")) {
-            if (!(boolean) NativeReflection.call(token, "canShowWhenLocked")) homeTokens.add(token);
+            boolean lockable = (boolean) NativeReflection.call(token, "canShowWhenLocked");
+            Object client = null;
+            try { client = NativeReflection.call(token, "getWallpaperClient"); } catch (Throwable ignored) { }
+            if (client == null) try {
+                for (Object win : (List<?>) NativeReflection.get(token, "mChildren")) { client = NativeReflection.get(win, "mClient"); if (client != null) break; }
+            } catch (Throwable ignored) { }
+            String pkg = "?";
+            try { if (client != null) pkg = String.valueOf(NativeReflection.call(NativeReflection.call(client, "getSession"), "getPackage")); } catch (Throwable ignored) { }
+            // Which wallpaper clients this module is taking visibility decisions for. This device runs
+            // a third-party live wallpaper for HOME, so a HOME token here is not MIUI's engine and
+            // can never produce the producer frames the scene waits for.
+            if (tokenJournal.length() < 240) tokenJournal.append(pkg).append(lockable ? ":lock" : ":home").append(' ');
+            if (!lockable) homeTokens.add(token);
             else for (Object window : (List<?>) NativeReflection.get(token, "mChildren"))
                 if (selectedLayer > 0 && layer(surface(window)) == selectedLayer) { nextWindow = window; nextToken = token; }
         }
+        wallpaperClients = tokenJournal.length() == 0 ? "none" : tokenJournal.toString().trim();
         if (nextWindow != lockWindow) { protectAndInvalidate(); lockWindow = nextWindow; lockToken = nextToken; }
         boolean exclusive = true;
         if (lockWindow != null) for (var frame : producerFrames)
@@ -646,7 +731,12 @@ final class SystemServerSceneHooks {
         Method named = NativeReflection.methodOrNull(controller.getClass(), "getWallpaperSurface", boolean.class);
         if (named != null) {
             Object target = NativeReflection.invoke(named, controller, lock);
-            return target == null ? -1 : layer((SurfaceControl) NativeReflection.call(target, "getLeash"));
+            if (target == null) return -1;
+            // The animator's leash is a method on builds that added an accessor and the field
+            // itself on builds that did not; either answers the same surface.
+            SurfaceControl leash = (SurfaceControl) NativeReflection.optCall(target, "getLeash");
+            if (leash == null) leash = (SurfaceControl) NativeReflection.optGet(target, "mLeash");
+            return layer(leash);
         }
         for (Object token : (List<?>) NativeReflection.get(controller, "mWallpaperTokens")) {
             if ((boolean) NativeReflection.call(token, "canShowWhenLocked") != lock) continue;
@@ -689,12 +779,24 @@ final class SystemServerSceneHooks {
         // target's drawing-related sleep query inside its synchronous resume call. Never remove
         // sleep tokens, set keyguard flags, move tasks, or synthesize USER_PRESENT.
         activatingActivity.set(selected);
+        String before = state, after = state;
+        boolean made = false;
         try {
-            NativeReflection.invoke(NativeReflection.method(selected.getClass(), "makeActiveIfNeeded", selected.getClass()), selected, (Object) null);
-            if (String.valueOf(NativeReflection.call(selected, "getState")).equals("RESUMED")) {
-                resumedByScene = selected; resumeAcknowledged = false;
+            Object result = NativeReflection.invoke(NativeReflection.method(selected.getClass(), "makeActiveIfNeeded", selected.getClass()), selected, (Object) null);
+            made = Boolean.TRUE.equals(result);
+            after = String.valueOf(NativeReflection.call(selected, "getState"));
+            if (after.equals("RESUMED")) {
+                resumedByScene = selected; resumeAcknowledged = false; resumedBySceneAt = now();
             }
         } finally { activatingActivity.remove(); }
+        // Diagnostics for a port to a build nobody here owns: whether forcing the client awake
+        // reaches the target at all, and what it changed. Deduplicated by CompatLog.
+        try {
+            reporter.compat.note("框架场景", "client " + before + "->" + after + " made=" + made
+                    + " attached=" + NativeReflection.call(selected, "attachedToProcess")
+                    + " visible=" + NativeReflection.call(selected, "isVisible")
+                    + " clientVisible=" + NativeReflection.call(selected, "isClientVisible"));
+        } catch (Throwable ignored) { }
     }
     private boolean inputOwnedByShade() {
         if (shadeWindow == null || target == null) return false;
@@ -707,10 +809,46 @@ final class SystemServerSceneHooks {
     private boolean activationPermitted() {
         return SceneActivation.permitted(allowed(), appAllowed(), coverCommitted(), inputOwnedByShade(), safeActivity(target));
     }
+    /**
+     * Whether the return target can be asked for a frame.
+     *
+     * <p>A resume this module forced itself must be acknowledged by the build's own
+     * {@code activityResumedLocked} before it counts, which is what {@code resumeAcknowledged}
+     * carries. Some builds resume through a path that never raises that signal: measured on OS2,
+     * where the forced target reads {@code RESUMED}, is visible and is drawn while
+     * {@code resumeAck} stays false. There the acknowledgement gate blocked the draw request
+     * forever - {@code drawGate=renderer} - so the scene never became ready, the cover stayed
+     * opaque instead of revealing, and a swipe that followed the finger perfectly still showed
+     * nothing underneath. The gate is therefore given a grace period: what it protects is only
+     * whether a frame may be *asked for*, while the frame's authenticity is decided further down by
+     * the client delivery and the presentation fence, which this does not touch.
+     */
     private boolean rendererReady() {
-        return target != null && String.valueOf(NativeReflection.call(target, "getState")).equals("RESUMED")
-                && (resumedByScene != target || resumeAcknowledged);
+        if (target == null || !String.valueOf(NativeReflection.call(target, "getState")).equals("RESUMED"))
+            return false;
+        if (resumedByScene != target || resumeAcknowledged) return true;
+        return now() - resumedBySceneAt >= RESUME_ACK_GRACE_MS;
     }
+    /**
+     * Whether the draw request may be issued against this return window.
+     *
+     * <p>{@link #rendererReady()} alone is too strict for a gesture that is still on its way up. This
+     * build resumes the return target itself only once the keyguard starts going away, which happens
+     * after release, so during the drag the target reads STARTED - and requiring RESUMED there meant
+     * no frame was ever requested, {@code drawGate=renderer}, the scene never became ready, and the
+     * cover stayed opaque for the whole gesture: the desktop could only appear at the very end. A
+     * STARTED activity is still visible and drawing, and nothing here is taken on faith - the request
+     * still has to come back through the client delivery and the presentation fence, and a request
+     * that is never answered is retried and finally timed out.
+     */
+    private boolean rendererReady(Object window) {
+        if (rendererReady()) return true;
+        return revealing && window != null
+                && (boolean) NativeReflection.call(window, "isDrawn")
+                && (boolean) NativeReflection.call(window, "isVisibleRequested");
+    }
+    /** How long a forced resume may wait for this build's acknowledgement before being trusted. */
+    private static final long RESUME_ACK_GRACE_MS = 300;
     private void restoreLifecycle() {
         Object old = resumedByScene; resumedByScene = null; resumeAcknowledged = false;
         if (old == null) return;
@@ -758,17 +896,54 @@ final class SystemServerSceneHooks {
                 });
     }
     private SurfaceControl clientSurface(Object window){return window==null?null:(SurfaceControl)NativeReflection.optCall(window,"getClientViewRootSurface");}
+    /** Which route the last buffer lookup took, appended to the readiness line. */
+    private volatile String surfacePath = " path=unresolved";
     private SurfaceControl bufferSurface(Object window) {
-        if(window==null)return null;
+        if(window==null){ surfacePath=" path=no-window"; return null; }
         // Android 17 may put the client BLAST buffer beneath the server WindowState surface.
         // WMS hides the server container in that mode. Never lease or restore client-owned
         // buffer visibility: the app retains authority over its child surface lifecycle.
         // Android 17's client-surface mode; absent on older builds, where the server owns the buffer layer.
         Method clientSurface = NativeReflection.methodOrNull(WindowManager.class, "useClientSurface");
-        if (clientSurface != null && (boolean) NativeReflection.invoke(clientSurface, null))
-            return surface(window);
+        boolean client = clientSurface != null && (boolean) NativeReflection.invoke(clientSurface, null);
+        if (client) {
+            SurfaceControl held = surface(window);
+            // Reported only: which route this build takes and whether it produced a usable layer.
+            surfacePath = " path=client method=" + (clientSurface != null)
+                    + " surface=" + (held != null) + " valid=" + (held != null && held.isValid());
+            return held;
+        }
         Object animator = NativeReflection.get(window, "mWinAnimator");
-        return (SurfaceControl) NativeReflection.get(animator, "mSurfaceControl");
+        SurfaceControl held = animatorSurface(animator);
+        // A build where the client owns its surface root leaves the animator without a buffer
+        // layer, and the window itself holds the client's view root instead. Only consulted when
+        // the animator produced nothing, so a build that has one is unaffected.
+        if (held == null) held = clientRootSurface(window);
+        surfacePath = " path=animator method=" + (clientSurface != null)
+                + " animator=" + (animator != null) + " surface=" + (held != null)
+                + " valid=" + (held != null && held.isValid());
+        return held;
+    }
+    /**
+     * The SurfaceControl a window's animator owns. Builds with the client-surface refactor keep it
+     * in a field of its own; in the shape before that the animator holds a WindowSurfaceController
+     * and exposes the same control through itself, which is what is used when the field is absent.
+     */
+    private static SurfaceControl animatorSurface(Object animator) {
+        if (animator == null) return null;
+        SurfaceControl held = (SurfaceControl) NativeReflection.optGet(animator, "mSurfaceControl");
+        return held != null ? held : (SurfaceControl) NativeReflection.optCall(animator, "getSurfaceControl");
+    }
+    /**
+     * The client's own view-root layer. Builds after the client-surface refactor keep the app's
+     * buffer here rather than on the server-side animator, which then has nothing to hand out.
+     */
+    private static SurfaceControl clientRootSurface(Object window) {
+        for (String name : new String[]{"getClientViewRootSurface", "getClientSurface", "getSurfaceControl"}) {
+            Object held = NativeReflection.optCall(window, name);
+            if (held instanceof SurfaceControl && ((SurfaceControl) held).isValid()) return (SurfaceControl) held;
+        }
+        return null;
     }
     private void prepareSurfaces() {
         if (!allowed() || !appAllowed() || !coverCommitted() || !safeActivity(target)) return;
@@ -847,26 +1022,44 @@ final class SystemServerSceneHooks {
                 }
             }
         }
+        // Only a real HOME producer layer may serve as the desktop backdrop. The lock producer's
+        // layer is NOT usable here: the mirror leases it through copyFrom and releases it on
+        // restore, so handing it over as a long-lived backdrop left the cover believing the desktop
+        // was covered while the underlying layer had already gone - the desktop came up blank.
+        // A backdrop must be a layer that really sits BELOW the return window. The lock wallpaper
+        // token does not: it belongs to the keyguard container, which is above the launcher, so
+        // handing it to useNativeHome left the desktop showing nothing but wallpaper with every icon
+        // hidden, and a black screen after the display had been off a while. The HOME producer frame
+        // is the only layer this may use, and this build has none while the keyguard covers it, so
+        // there is deliberately no fallback here.
         // This proves only a live HOME wallpaper, never the selected app/launcher's frame.
         if (appAllowed() && coverCommitted() && fallbackSource != null && cover != null) {
             if (home) cover.useNativeHome(fallbackSource, fallbackGeneration);
             else {
                 cover.requireLockProtection();
-                if (!(currentFrame && rendererReady() && visible && parents)) cover.prepareHome(fallbackSource, fallbackGeneration);
+                if (!(currentFrame && rendererReady(window) && visible && parents)) cover.prepareHome(fallbackSource, fallbackGeneration);
             }
         }
         SceneReadiness.Target kind = target == null ? SceneReadiness.Target.NONE
                 : home ? SceneReadiness.Target.HOME : SceneReadiness.Target.APP;
+        // A HOME return needs a wallpaper behind it. The desktop engine cannot have drawn while the
+        // keyguard still covers it - the device measures DesktopImageEngineImpl valid=false for the
+        // whole gesture - so the live lock producer is accepted as that evidence instead. On this
+        // build both roles share one wallpaper client (roles=3), so it is the same image. Requiring
+        // the desktop engine here made the quorum unsatisfiable for an entire slow drag, which is
+        // what turned "swipe up to unlock" into a five second wait followed by a rebound.
+        boolean homeWallpaper = homeEngineDrawn && homeWindowDrawn
+                || kind == SceneReadiness.Target.HOME && lockEngineDrawn;
         String reason = !appAllowed() ? "等待原生认证资格" : target == null ? "返回目标未允许（安全窗口/进程/用户限制）"
                 : !visible ? "返回窗口未显示" : !parents ? "返回窗口祖先层未显示"
-                : !rendererReady() ? "等待返回目标原生 RESUME 回执" : !currentFrame ? "等待本绑定新帧呈现 fence" : !presentation.handoff() && !inputOwnedByShade() ? "等待 SystemUI 保持输入焦点"
+                : !rendererReady(window) ? "等待返回目标原生 RESUME 回执" : !currentFrame ? "等待本绑定新帧呈现 fence" : !presentation.handoff() && !inputOwnedByShade() ? "等待 SystemUI 保持输入焦点"
                 : !mirror.committed() ? "等待锁屏镜像首帧提交" : !mirror.ready() ? "等待原始锁屏容器脱离合成"
-                : !valid ? "等待锁屏引擎本会话 EGL swap" : home && !(homeEngineDrawn && homeWindowDrawn)
+                : !valid ? "等待锁屏引擎本会话 EGL swap" : !homeWallpaper
                 ? "等待桌面引擎与窗口绘制" : "返回目标与绘制链就绪";
         long windowGeneration = window == null || bufferSurface(window) == null ? 0
                 : ((Number) NativeReflection.call(bufferSurface(window), "getLayerId")).longValue();
         SceneReadiness state = new SceneReadiness(lease.id(), kind, windowGeneration,
-                appAllowed(), visible, parents, currentFrame && rendererReady() && (presentation.handoff() || inputOwnedByShade()), homeEngineDrawn && homeWindowDrawn, valid, reason,
+                appAllowed(), visible, parents, currentFrame && rendererReady(window) && (presentation.handoff() || inputOwnedByShade()), homeWallpaper, valid, reason,
                 identity(window), presentation.epoch(), presentation.drawSequence(), currentFrame);
         boolean ready = state.ready();
         boolean nativeFocused = window != null && NativeReflection.get(NativeReflection.get(window, "mDisplayContent"), "mCurrentFocus") == window;
@@ -875,11 +1068,33 @@ final class SystemServerSceneHooks {
                 (boolean)invokeKeyguard("isKeyguardGoingAway"), presentation.foregroundHiddenCommitted(), rendererReady(),
                 nativeFocused, drawn, window != null && (boolean)NativeReflection.call(window,"isVisibleRequested")
                     && surfaces.nativeAncestorsShown(bufferSurface(window)), parents);
-        if (ready || nativeTakeoverConfirmed) {
+        // The cover belongs to a live scene. publishScene is also invoked from late callbacks and
+        // refreshes after the lease has been cleared, and the "else protect" branch below used to
+        // light the cover there - one more way a wallpaper mirror ended up at alpha 1 over the
+        // desktop (only-wallpaper, control panel hidden, swipe unresponsive) long after the unlock.
+        // A cleared lease must never touch the cover; retirement is the only remaining actor.
+        if (lease.id() < 0) {
+            unreadySince = 0;
+        } else if (ready || nativeTakeoverConfirmed) {
+            unreadySince = 0;
             cover.reveal(true);
             if (ready && cover.exposureComplete() && presentation.handoff() && !(boolean)invokeKeyguard("isKeyguardLocked"))
                 presentation.nativeOwned(surfaces.nativeAncestorsShown(bufferSurface(window)), parents);
-        } else if (cover != null) cover.protect();
+        } else if (cover != null) {
+            // Debounced re-cover. A transient readiness dip (the return window's fence and surface
+            // change while the finger is down) must not flash the square cover back over the sheet's
+            // rounded edge - that was the "corner turns square 2-3 times" flicker. But a scene that
+            // stays un-presentable must re-cover, or the transparent cover leaves the blank return
+            // window showing "only the wallpaper" until a sleep/wake resets it. Only a persistent
+            // !ready crosses the threshold.
+            long now = SystemClock.uptimeMillis();
+            if (unreadySince == 0) unreadySince = now;
+            else if (now - unreadySince >= COVER_RECOVER_MS) { unreadySince = 0; cover.protect(); }
+        }
+        // The cover's own timeline. "透图没出来" and "透图出来得太晚" are different defects with
+        // different fixes, and the readiness line alone cannot tell them apart because it only
+        // ever shows the state at the moment it was sampled.
+        noteCover(ready, visible, parents, window != null && (boolean)NativeReflection.call(window, "isVisibleRequested"));
         reporter.returnTarget = kind.name(); reporter.surfaceGeneration = state.surfaceGeneration();
         reporter.sceneReadiness = "session=" + lease.id() + " target=" + kind + " generation=" + state.surfaceGeneration()
                 + " phase=" + presentation.phase() + " binding=" + presentation.epoch() + " drawSeq=" + presentation.drawSequence() + " presented=" + presentation.ready() + " proof=" + presentation.proofSource()
@@ -887,12 +1102,14 @@ final class SystemServerSceneHooks {
                 + " currentFrame=" + currentFrame + " homeComposited=" + homeWindowDrawn
                 + " backdrop=" + (cover != null && cover.backdropReady()) + " blended=" + (cover != null && cover.exposureComplete())
                 + " nativeTakeover=" + nativeTakeoverConfirmed + " focused=" + nativeFocused
-                + " blocker=" + (window == null ? "no-window" : surfaces.blocker(bufferSurface(window)))
+                + " blocker=" + (window == null ? "no-window" : surfaces.blocker(bufferSurface(window))) + surfacePath
                 + " homeSwap=" + homeEngineDrawn + " lockSwap=" + lockEngineDrawn + " ready=" + ready
                 + " client=" + (target != null && (boolean) NativeReflection.call(target, "isClientVisible"))
                 + " activity=" + (target == null ? "NONE" : NativeReflection.call(target, "getState"))
                 + " startOnly=" + reporter.startOnly.get()
-                + " rendererResumed=" + rendererReady() + " resumeAck=" + resumeAcknowledged + " inputShade=" + inputOwnedByShade()
+                + " rendererResumed=" + rendererReady() + " resumeAck=" + resumeAcknowledged
+                + " ackWait=" + (resumedByScene != null && !resumeAcknowledged ? now() - resumedBySceneAt : -1)
+                + " inputShade=" + inputOwnedByShade()
                 + " revealing=" + revealing
                 + " coverCommitted=" + coverCommitted()
                 + " mirrorGeneration=" + mirror.generation() + " mirrorCommitted=" + mirror.committed() + " sourceDetached=" + mirror.ready()
@@ -902,6 +1119,25 @@ final class SystemServerSceneHooks {
                 + " draw=" + drawDiagnostics()
                 + " baseline=" + java.util.Arrays.toString(wallpaperMatrix());
         reporter.liveScene = reason;
+        // The readiness line is capped at 2048 chars on the way out, so the fields this scene is
+        // actually decided by are also published on their own short line.
+        reporter.diag = "phase=" + presentation.phase() + " drawSeq=" + presentation.drawSequence()
+                + " ready=" + ready + " missing=" + state.missing()
+                + " " + (cover == null ? "cover=absent" : cover.revealState())
+                + " backdrop=" + (cover == null ? "absent" : cover.backdropState())
+                + " cover=[" + coverJournal + "]"
++ " clients=" + wallpaperClients
+                + " deferHold=" + (!revealing && !presentation.handoff())
+                + " drawGate=" + (drawGate == null ? "requested" : drawGate)
+                + " fence=" + fences.receipt()
+                + " drawReq=" + drawRequests + " complete=" + drawCompletions
+                + " mirror=" + mirror.generation() + "/" + mirror.committed() + "/" + mirror.ready()
+                + " lockGen=" + lockGeneration
+                + " binding=" + presentation.epoch() + " presented=" + presentation.ready()
+                + " proof=" + presentation.proofSource()
+                + " drawnRefusal=" + presentation.drawnRefusal()
+                + " hazards=" + hazards.size() + " lastDraw=" + lastDrawReceipt
+                + " (" + reason + ")";
         // Preserve HOME's actual blocker after a later APP scene or END replaces the live row.
         if (home) reporter.lastHomeReadiness = reporter.sceneReadiness + " reason=" + reason;
         if (!reporter.sceneReadiness.equals(lastStatus) || ready != lastReady) {
@@ -922,25 +1158,62 @@ final class SystemServerSceneHooks {
     private void surfaceHazard(SurfaceControl.Transaction transaction) {
         if (nativeTakeoverConfirmed) return;
         if (cover == null || !cover.bound() || lease.id() < 0) return;
-        cover.protect(transaction); presentation.invalidate(); drawWindow = null;
+        cover.protect(transaction);
+        // A hazard means the proof in hand is stale and a new one must be taken. Taking that decision
+        // again while the replacement is still in flight destroys the replacement too. This device
+        // measured exactly that: 468 requests with 461 completions and a binding epoch of 1439, where
+        // a fence landed and the epoch was bumped in the same breath, so presented() never saw a
+        // matching binding, the scene never became ready during the gesture, and the cover - which
+        // only reveals on ready - stayed opaque until the churn stopped at release. That is why the
+        // desktop appeared only at the end of the swipe. One invalidation per quiet window is enough;
+        // a proof taken across a real topology change is still refused downstream, because
+        // presentation.matches re-checks the selected window identity and its layer.
+        if (now() - lastDrawRequestAt < HAZARD_QUIET_MS) return;
         // Do not issue the next draw against the pre-commit topology of this destructive txn.
         synchronized (hazards) { if (!hazards.add(transaction)) return; }
+        presentation.invalidate(); drawWindow = null;
         long id = lease.id();
         transaction.addTransactionCommittedListener(handler::post, () -> guarded(() -> {
             synchronized (hazards) { hazards.remove(transaction); }
             if (id != lease.id()) return;
+            if (now() - lastDrawRequestAt < HAZARD_QUIET_MS) { publishScene(); return; }
             presentation.invalidate(); drawWindow = null; publishScene();
         }));
     }
+    /** How long an issued draw request is left alone so its fence can land; see surfaceHazard. */
+    private static final long HAZARD_QUIET_MS = 150;
+    private long lastDrawRequestAt;
     private void protectAndInvalidate() {
         if (cover != null) cover.protect(); presentation.invalidate(); drawWindow = null;
     }
+    /**
+     * True once a handoff has been held longer than any terminal receipt is worth waiting for.
+     * See {@link #stop(String, boolean)}: the refusal it guards would otherwise never lift.
+     */
+    private boolean handoffHoldExpired() {
+        long now = now();
+        if (handoffHoldSince == 0) { handoffHoldSince = now; return false; }
+        return now - handoffHoldSince >= HANDOFF_HOLD_MAX_MS;
+    }
+    private static final long HANDOFF_HOLD_MAX_MS = 1200;
+    private long handoffHoldSince;
     private void ensureReturnProof(Object window) {
-        synchronized (hazards) { if (!hazards.isEmpty()) return; }
-        if (window == null || !allowed() || !appAllowed() || !coverCommitted() || !rendererReady() || cover == null || !cover.bound()) return;
+        synchronized (hazards) { if (!hazards.isEmpty()) { drawGate="hazard"; return; } }
+        // The gates are named rather than inferred: this is where the scene's draw proof starts,
+        // and a miss here leaves drawSeq=-1, which reads as "waiting" everywhere downstream.
+        drawGate = window == null ? "window"
+                : !allowed() ? "allowed"
+                : !appAllowed() ? "appAllowed"
+                : !coverCommitted() ? "cover"
+                : !rendererReady(window) ? "renderer"
+                : cover == null ? "no-cover"
+                : !cover.bound() ? "cover-unbound" : null;
+        if (drawGate != null) return;
         SurfaceControl surface = bufferSurface(window); long layer = layer(surface),producerLayer=layer(clientSurface(window));
-        if (producerLayer<=0 || layer <= 0 || !(boolean)NativeReflection.call(window,"isVisibleRequested")) return;
-        if (drawWindow == window && drawLayer == layer && drawProducerLayer==producerLayer) return;
+        if (producerLayer <= 0) { drawGate="no-producer-layer"; return; }
+        if (layer <= 0) { drawGate="no-buffer-layer"; return; }
+        if (!(boolean)NativeReflection.call(window,"isVisibleRequested")) { drawGate="not-visible-requested"; return; }
+        if (drawWindow == window && drawLayer == layer && drawProducerLayer==producerLayer) { drawGate="already-requested"; return; }
         if (cover != null) cover.protect();
         drawWindow = window; drawLayer = layer; drawProducerLayer=producerLayer;
         long id = lease.id(), windowId = identity(window);
@@ -980,6 +1253,8 @@ final class SystemServerSceneHooks {
         NativeReflection.invoke(NativeReflection.method(window.getClass(),"applyWithNextDraw",java.util.function.Consumer.class),window,draw);
         expectedDrawSequence=NativeReflection.integer(window,NativeReflection.optBool(wm,"mAlwaysSeqId",false) && NativeReflection.has(window,"mBufferSeqId") ? "mBufferSeqId" : "mSyncSeqId");
         presentation.expect(epoch,expectedDrawSequence); drawRequests++;
+        // From here until this attempt resolves, hazards leave it alone; see surfaceHazard.
+        lastDrawRequestAt = now();
         // requestRedrawForSync only clears its reporting marker; reportResized drives the real client request.
         NativeReflection.optCall(window,"requestRedrawForSync"); NativeReflection.optCall(window,"forceReportingResized");
         NativeReflection.call(window,"reportResized");
@@ -995,7 +1270,8 @@ final class SystemServerSceneHooks {
     private String drawDiagnostics() {
         return "requests:"+drawRequests+"/queuedSent:"+queuedDrawDispatches+"/clients:"+clientDrawDeliveries+"/handlers:"+drawHandlers+"/timeouts:"+drawTimeouts
                 +"/null:"+drawNullBuffers+"/reject:"+drawRejected+"/complete:"+drawCompletions+"/expected:"+expectedDrawSequence
-                +"/clientLayer:"+drawProducerLayer+"/received:"+lastDeliveredSequence+"/preserved:"+preservedBufferRequests+"/retry:"+retriedDrawRequests+"/last:"+lastDrawReceipt+"/journal:"+drawJournal;
+                +"/clientLayer:"+drawProducerLayer+"/received:"+lastDeliveredSequence+"/preserved:"+preservedBufferRequests+"/retry:"+retriedDrawRequests+"/last:"+lastDrawReceipt+"/journal:"+drawJournal
+                +"/"+fences.receipt();
     }
     private void recordDrawReceipt(String receipt) {
         lastDrawReceipt=receipt;
@@ -1034,25 +1310,50 @@ final class SystemServerSceneHooks {
         // WindowState.getSurfaceControl is its server parent; mBbqSurfaceControl is its
         // BLAST child. Neither equals the engine root. Matching those two different
         // levels prevented the mirror being sent at all and deadlocked scene preparation.
-        SurfaceControl registeredRoot = (SurfaceControl)NativeReflection.get(NativeReflection.get(window,"mWinAnimator"),"mSurfaceControl");
+        SurfaceControl registeredRoot = animatorSurface(NativeReflection.get(window,"mWinAnimator"));
         long generation = 0;
         for (var frame : producerFrames)
             if (com.zhuanz.flymemotion.core.WallpaperFrameBinding.matches(frame.getInt("which"),which,
                     client.equals(frame.getBinder("client")),frame.getBoolean("drawn"),frame.getLong("drawSequence",0),
-                    frame.getLong("generation"),frame.getInt("containerLayer",-1),layer(registeredRoot)))
+                    frame.getLong("generation"),frame.getInt("containerLayer",-1),frame.getInt("bufferLayer",-1),layer(registeredRoot)))
                 generation = Math.max(generation, frame.getLong("generation"));
         return generation;
     }
     private String producerBindingDetail(Object window, int which) {
         if (window == null) return "no-window";
-        SurfaceControl clientRoot = (SurfaceControl)NativeReflection.get(NativeReflection.get(window,"mWinAnimator"),"mSurfaceControl");
+        SurfaceControl clientRoot = animatorSurface(NativeReflection.get(window,"mWinAnimator"));
         android.os.IBinder client = ((android.os.IInterface)NativeReflection.get(window,"mClient")).asBinder();
-        StringBuilder detail = new StringBuilder("server:").append(layer(surface(window))).append("/client:").append(layer(clientRoot));
+        StringBuilder detail = new StringBuilder("server:").append(layer(surface(window))).append("/client:").append(layer(clientRoot))
+                .append("/clientParent:").append(parentLayer(clientRoot))
+                .append("/status:").append(producerStatusSeen).append("+").append(producerStatusDropped)
+                .append("/frames:").append(producerFrames.size());
         for (var frame : producerFrames) if ((frame.getInt("which") & which) != 0)
             detail.append("/engine:").append(frame.getInt("containerLayer",-1)).append("/sameWindow:")
-                    .append(client.equals(frame.getBinder("client"))).append("/fresh:").append(frame.getBoolean("drawn"));
+                    .append(client.equals(frame.getBinder("client"))).append("/fresh:").append(frame.getBoolean("drawn"))
+                    .append("/raw:seq=").append(frame.getLong("drawSequence",0)).append("/base=").append(frame.getLong("baseline",-1))
+                    .append("/gen=").append(frame.getLong("generation")).append("/vis=").append(frame.getBoolean("visible"))
+                    .append("/why:")
+                    .append(com.zhuanz.flymemotion.core.WallpaperFrameBinding.explain(frame.getInt("which"),which,
+                            client.equals(frame.getBinder("client")),frame.getBoolean("drawn"),frame.getLong("drawSequence",0),
+                            frame.getLong("generation"),frame.getInt("containerLayer",-1),frame.getInt("bufferLayer",-1),layer(clientRoot)));
         return detail.toString();
     }
+    /** The layer a surface sits under, for reading a client root's real place in the tree. */
+    private static long parentLayer(SurfaceControl surface) {
+        return surface == null ? -1 : layer((SurfaceControl) NativeReflection.optCall(surface, "getParent"));
+    }
+    /** Timeline of the cover's reveal decision, newest last; see the call site. */
+    private void noteCover(boolean ready, boolean visible, boolean parents, boolean visibleRequested) {
+        String state = (ready ? "ready" : "waiting") + "/visible=" + visible + "/parents=" + parents
+                + "/visReq=" + visibleRequested + "/blend=" + (cover != null && cover.exposureComplete())
+                + "/backdrop=" + (cover != null && cover.backdropReady());
+        if (state.equals(lastCoverState)) return;
+        lastCoverState = state;
+        if (coverJournal.size() >= 6) coverJournal.removeFirst();
+        coverJournal.addLast((now() % 100000) + " " + state);
+    }
+    private String lastCoverState;
+    private final java.util.ArrayDeque<String> coverJournal = new java.util.ArrayDeque<>();
     private void reply(long id, boolean ready, String status) {
         if (context == null || !registered || id < 0) return;
         String returnTarget = reporter.returnTarget, readiness = reporter.sceneReadiness;
@@ -1107,6 +1408,15 @@ final class SystemServerSceneHooks {
         // A swipe can be rolled back (target not yet allowed, LOCK not yet bound) moments before
         // native unlock; still ours to cover if it ended within 1.5 s.
         if(!live && now()-endedAt>1500) return null;
+        // Going-away is not by itself proof that the unlock happened. On this build MIUI raises it
+        // during the drag, before release, so retiring here kills the LOCK producer the live scene
+        // is still mirroring: lockSwap/mirrorCommitted stay false, phase never leaves PREPARING and
+        // nothing can be revealed for the rest of the gesture -- the "slow swipe past 50 releases
+        // with no unlock and no see-through" report, whose receipt shows exactly this journal entry
+        // (b9:native-going-away:lock-retired) with revealing=false. Retiring is only correct once
+        // the scene has actually handed off, so require the same predicate stop() uses. The scene
+        // still in flight is retired by stop() itself, which already knows the real exit state.
+        if (live && !(presentation.handoff() || authenticatedExit())) return null;
         boolean home=live&&target!=null ? (boolean)NativeReflection.call(target,"isActivityTypeHome") : focusedHome();
         Object lock=exitLockToken();
         if(!home || lock==null) return null;
@@ -1134,6 +1444,14 @@ final class SystemServerSceneHooks {
         return top!=null&&(boolean)NativeReflection.call(top,"isActivityTypeHome");
     }
     private final java.util.ArrayDeque<String> exitJournal = new java.util.ArrayDeque<>();
+    /**
+     * Delay before a wallpaper reconcile runs after a sleep/wake/lock callback. miuix22 posted it at
+     * 250ms, which left the lock wallpaper off-screen (black) for the first ~300ms of a wake - the
+     * "partial black then normal" flash the author's own README says was never confirmed on device.
+     * reconcile() already skips any token still in a native transition ("busy") and retries, so a
+     * shorter delay cannot fight the animation; it just re-mounts the wallpaper sooner.
+     */
+    private static final long RECONCILE_DELAY_MS = 40;
     /** Lock-wallpaper exit decisions, published as the framework's gestureJournal. */
     /**
      * Outside a scene, every wallpaper token back under the parent and visibility WM believes it
@@ -1155,7 +1473,7 @@ final class SystemServerSceneHooks {
             }
             if (busy && attempts > 1) reconcileWallpapers(why, attempts - 1);
             exitTrace("wallpaper:reconcile " + why + (busy ? " busy" : "") + " " + done.toString().trim());
-        }), 250);
+        }), RECONCILE_DELAY_MS);
     }
     private void exitTrace(String entry) {
         if (exitJournal.size() == 12) exitJournal.removeFirst();
@@ -1170,18 +1488,35 @@ final class SystemServerSceneHooks {
         exitTrace("stop lease="+old+" force="+forceCancel+" homeLock="+(endedHomeLock!=null)+" "+reason);
         // Once native auth owns unlock, focus loss/end/heartbeat expiry cannot undo the scene.
         // Sleep, AOD, a real new lock or explicit disable are the explicit cancellation routes.
+        //
+        // The wait below is for a terminal receipt - nativeOwned, or takeover confirmed with the
+        // cover fully exposed - and this build may never send one. Waiting forever is not neutral:
+        // the cover is a wallpaper mirror, so one left in place reads on the phone as a desktop that
+        // has lost every icon, and as a black lockscreen once the display has cycled; only sleep
+        // clears it, which is why it appeared to heal after a rest. Bound the wait, then fall
+        // through to the normal path, which still computes handoff and so never replays the
+        // pre-transition hidden state.
         if (!forceCancel && presentation.handoff() && nativeUnlockStarted()
                 && presentation.phase() != com.zhuanz.flymemotion.core.ScenePresentation.Phase.NATIVE_OWNED
-                && !(nativeTakeoverConfirmed && cover != null && cover.exposureComplete())) {
+                && !(nativeTakeoverConfirmed && cover != null && cover.exposureComplete())
+                && !handoffHoldExpired()) {
             reporter.liveScene = "原生交接尚未取得完整回执，保留场景：" + reason; reporter.publish();
             if (handler != null) { handler.removeCallbacks(watch); handler.postDelayed(watch,150); }
             return;
         }
+        handoffHoldSince = 0;
         boolean handoff = keyguard != null && (SceneExitPolicy.completedNativeExit(nativeTakeoverConfirmed,
                 (boolean) invokeKeyguard("isKeyguardShowing"), (boolean) invokeKeyguard("isKeyguardLocked"), forceCancel)
                 || SceneExitPolicy.handoff(forceCancel, clientCanDismiss,
                 target != null && safeActivity(target), (boolean) invokeKeyguard("isKeyguardLocked"),
-                (boolean) invokeKeyguard("isKeyguardGoingAway")));
+                (boolean) invokeKeyguard("isKeyguardGoingAway"))
+                // A keyguard that is gone and no longer locked means the unlock already happened,
+                // whatever our own receipts say. Falling through to the cancel path there replays the
+                // pre-transition hidden intent onto the return client, which leaves the desktop
+                // showing its wallpaper with every icon missing - the exact state the phone reported
+                // after some unlocks, and one that only a later lock cycle cleared.
+                || (!forceCancel && !(boolean) invokeKeyguard("isKeyguardShowing")
+                    && !(boolean) invokeKeyguard("isKeyguardLocked")));
         nativeExitRequested=false; nativeTakeoverConfirmed=false; lease.clear(); presentation.end(); synchronized (hazards) { hazards.clear(); } drawWindow = null; drawLayer = drawProducerLayer = -1; target = candidate = null;
         revealing = false;
         reporter.sceneSession = -1; reporter.returnTarget = "NONE";

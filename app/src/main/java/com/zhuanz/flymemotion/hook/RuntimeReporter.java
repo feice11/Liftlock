@@ -27,6 +27,11 @@ final class RuntimeReporter {
     volatile String sceneReadiness = "等待真实场景绘制", returnTarget = "NONE";
     volatile String lastExitReadiness = "none";
     volatile String lastHomeReadiness = "尚无桌面场景回执";
+    /**
+     * Short single-line diagnostics. The readiness line is capped by the receipt transport once it
+     * grows past a few kilobytes, so anything that must always be readable lives here instead.
+     */
+    volatile String diag = "";
     volatile long sceneSession = -1, surfaceGeneration;
     volatile long revokeNonce;
     volatile boolean panelFound, keyguardFound, wallpaperBound;
@@ -86,6 +91,7 @@ final class RuntimeReporter {
             data.putString("desktopAnimationState",desktopAnimationState);data.putString("desktopAnimationDetail",desktopAnimationDetail);
             data.putString("lastExitReadiness", lastExitReadiness);
             data.putString("lastHomeReadiness", lastHomeReadiness);
+            data.putString("diag", diag);
             data.putLong("sceneSession", sceneSession); data.putLong("surfaceGeneration", surfaceGeneration);
             data.putLong("revokeNonce", revokeNonce);
             data.putBoolean("panelFound", panelFound); data.putBoolean("keyguardFound", keyguardFound);

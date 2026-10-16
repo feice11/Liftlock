@@ -26,8 +26,15 @@ public final class LockscreenReleaseTest {
     }
     @Test public void stationaryReleaseUsesNativeFlingTypeAndDistance() {
         var types = new ArrayList<Integer>();
-        var decision = LockscreenRelease.decide(input(.8f, 0, true), MotionConfig.defaults(), t -> { types.add(t); return false; });
-        assertEquals(java.util.List.of(4, 7), types); assertTrue(decision.expand());
+        // A stationary release short of the threshold springs back ...
+        var short_ = LockscreenRelease.decide(input(.4f, 0, true), MotionConfig.defaults(), t -> { types.add(t); return false; });
+        assertTrue(short_.expand());
+        // ... and one that covered more than the threshold unlocks, which for a dismissible
+        // lockscreen is the whole point of a slow drag.
+        var past = LockscreenRelease.decide(input(.8f, 0, true), MotionConfig.defaults(), t -> { types.add(t); return false; });
+        assertFalse(past.expand());
+        // Both still consult the two native interaction types, in this order.
+        assertEquals(java.util.List.of(4, 7, 4, 7), types);
     }
     @Test public void eitherNativeRejectionRebounds() {
         for (int rejected : new int[]{1, 2}) {
@@ -40,8 +47,9 @@ public final class LockscreenReleaseTest {
         assertTrue(LockscreenRelease.decide(input(.3f, 2100, true), MotionConfig.defaults(), t -> false).expand());
     }
     @Test public void slowReleaseUsesPinnedDistanceThreshold() {
-        assertTrue(LockscreenRelease.decide(input(.6f, -100, true), MotionConfig.defaults(), t -> false).expand());
-        assertFalse(LockscreenRelease.decide(input(.4f, -100, true), MotionConfig.defaults(), t -> false).expand());
+        // Too slow to be a flick: the distance decides, and past the threshold the unlock commits.
+        assertFalse(LockscreenRelease.decide(input(.6f, -100, true), MotionConfig.defaults(), t -> false).expand());
+        assertTrue(LockscreenRelease.decide(input(.4f, -100, true), MotionConfig.defaults(), t -> false).expand());
     }
     @Test public void invalidNativeSnapshotDoesNotQueryFalsing() {
         for (float invalid : new float[]{Float.NaN, Float.POSITIVE_INFINITY}) {

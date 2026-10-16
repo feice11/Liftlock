@@ -32,12 +32,20 @@ public final class ScenePresentation {
         return phase != Phase.ENDED && session == id && epoch == binding && window == windowId && surface == layer;
     }
     public synchronized void expect(long binding, int sequence) { if (binding == epoch) expectedSequence = sequence; }
+    /** Which term of {@link #drawn} refused the last delivery, so the proof chain is inspectable. */
+    private String drawnRefusal = "none";
+    public synchronized String drawnRefusal() { return drawnRefusal; }
     public synchronized boolean drawn(long binding, int sequence, boolean realTransaction) {
-        if (binding != epoch || phase == Phase.ENDED || producerProof || !realTransaction || sequence == Integer.MAX_VALUE || sequence < expectedSequence) return false;
+        if (binding != epoch) { drawnRefusal = "epoch " + binding + "!=" + epoch; return false; }
+        if (phase == Phase.ENDED) { drawnRefusal = "ended"; return false; }
+        if (producerProof) { drawnRefusal = "producerProof"; return false; }
+        if (!realTransaction) { drawnRefusal = "no-buffer-transaction"; return false; }
+        if (sequence == Integer.MAX_VALUE) { drawnRefusal = "max-sequence"; return false; }
+        if (sequence < expectedSequence) { drawnRefusal = "sequence " + sequence + "<" + expectedSequence; return false; }
         // Pin the first accepted draw until its fence returns. A later app frame must not
         // orphan that outstanding completion callback. Rebinding/invalidation starts afresh.
-        if (freshDraw) return sequence == drawSequence;
-        freshDraw = true; drawSequence = sequence; return true;
+        if (freshDraw) { drawnRefusal = "pinned " + sequence + "!=" + drawSequence; return sequence == drawSequence; }
+        freshDraw = true; drawSequence = sequence; drawnRefusal = "accepted " + sequence; return true;
     }
     public synchronized boolean presented(long binding, long sequence, boolean latched, boolean fenceSignalled) {
         if (binding != epoch || !freshDraw || sequence != drawSequence || !latched || !fenceSignalled || phase == Phase.ENDED) return false;

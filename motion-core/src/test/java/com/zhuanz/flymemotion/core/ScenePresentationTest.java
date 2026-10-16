@@ -154,6 +154,29 @@ public final class ScenePresentationTest {
         assertFalse(LockCycle.newLock(true, true, true, true, false));
         assertFalse(LockCycle.newLock(true, false, true, true, true));
     }
+    @Test public void aRefusedDrawNamesTheTermThatRefusedIt() {
+        // The OS2 device measured 475 completed client draws with drawSequence still -1; the proof
+        // chain has to say which term said no rather than leave that to be guessed.
+        var s = new ScenePresentation(); long epoch = s.bind(1, 2, 3, 7);
+        assertFalse(s.drawn(epoch - 1, 7, true));
+        assertTrue(s.drawnRefusal().startsWith("epoch"));
+        assertFalse(s.drawn(epoch, 7, false));
+        assertEquals("no-buffer-transaction", s.drawnRefusal());
+        assertFalse(s.drawn(epoch, 6, true));
+        assertEquals("sequence 6<7", s.drawnRefusal());
+        assertFalse(s.drawn(epoch, Integer.MAX_VALUE, true));
+        assertEquals("max-sequence", s.drawnRefusal());
+        assertTrue(s.drawn(epoch, 7, true));
+        assertEquals("accepted 7", s.drawnRefusal());
+        // Once pinned, a later frame is refused by name instead of silently.
+        assertFalse(s.drawn(epoch, 8, true));
+        assertEquals("pinned 8!=7", s.drawnRefusal());
+        // Producer proof closes the client path, and says so.
+        var p = new ScenePresentation(); long bound = p.bind(1, 2, 3, 0);
+        assertTrue(p.producerPresented(bound, 1, true, true));
+        assertFalse(p.drawn(bound, 5, true));
+        assertEquals("producerProof", p.drawnRefusal());
+    }
     private static ScenePresentation ready() {
         var s = new ScenePresentation(); long epoch = s.bind(1, 2, 3, 5);
         s.drawn(epoch, 5, true); s.presented(epoch, 5, true, true); return s;

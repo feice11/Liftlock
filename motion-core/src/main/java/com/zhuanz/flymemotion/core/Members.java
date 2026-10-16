@@ -44,6 +44,20 @@ public final class Members {
     }
 
     /**
+     * The first candidate that has a body. An abstract declaration has none to hook, and the
+     * method an instance actually runs is the one its own class implements, so a caller that needs
+     * the real method skips it: the panel declares the AOSP names abstract on the builds this was
+     * added for and the MIUI subclass that is instantiated implements them.
+     */
+    public static Method concrete(Class<?> type, Sig... candidates) {
+        for (Sig sig : candidates) {
+            Method m = declared(type, sig.name(), sig.params());
+            if (m != null && !Modifier.isAbstract(m.getModifiers())) return m;
+        }
+        return null;
+    }
+
+    /**
      * The synthetic static accessor an inner class uses to reach {@code outer}'s private method:
      * javac's {@code -$$Nest$m<name>} (D8 desugaring) or {@code access$NNN}. Parameters are the
      * outer instance followed by the private method's own. Null when the build calls it directly.
@@ -127,10 +141,20 @@ public final class Members {
      */
     public static Class<?> inner(ClassLoader loader, Class<?> outer, Predicate<Class<?>> test, String... hints) {
         List<String> names = new ArrayList<>();
+        List<String> miui = new ArrayList<>();
         for (String hint : hints) {
             names.add(outer.getName() + "$" + hint);
             for (int i = 1; i <= 9; i++) names.add(outer.getName() + "$" + hint + "$" + i);
+            // An anonymous class is named after the field it is assigned to, and MIUI prefixes
+            // those with `m` (mKeyguardUpdateMonitorCallback$1). Tried after the shapes above, so a
+            // build that already answers keeps answering the same class.
+            if (hint.isEmpty()) continue;
+            String prefixed = "m" + Character.toUpperCase(hint.charAt(0)) + hint.substring(1);
+            miui.add(outer.getName() + "$" + prefixed);
+            for (int i = 1; i <= 9; i++) miui.add(outer.getName() + "$" + prefixed + "$" + i);
         }
+        for (int i = 1; i <= 40; i++) names.add(outer.getName() + "$" + i);
+        names.addAll(miui);
         for (int i = 1; i <= 40; i++) names.add(outer.getName() + "$" + i);
         for (String name : names) {
             Class<?> c = load(loader, name);
